@@ -13,6 +13,8 @@ import re
 import string
 import sys
 import uuid
+import textwrap
+import time
 import warnings
 from datetime import datetime, timezone
 from functools import partial
@@ -1752,24 +1754,30 @@ class KubeSpawner(Spawner):
     )
 
     profile_list = Union(
-        trait_types=[List(trait=Dict()), Callable()],
+        trait_types=[List(trait=Dict()), Callable(), Dict()],
         config=True,
         help="""
-        List of profiles to offer for selection by the user.
+        Callable, List or Dict of profiles to offer for selection by the user.
 
-        Signature is: `List(Dict())`, where each item is a dictionary that has two keys:
+        - If a list, then each item is a dictionary.
+        - If it's a dictionary, then its keys are "slugs" - machine
+        readable strings that identify a profile. The values are dictionaries.
+
+        In both cases, the inner, dictionaries representing the profiles,
+        have the following keys:
 
         - `display_name`: the human readable display name (should be HTML safe)
         - `default`: (Optional Bool) True if this is the default selected option
         - `description`: Optional description of this profile displayed to the user.
         - `slug`: (Optional) the machine readable string to identify the
-          profile (missing slugs are generated from display_name)
+          profile (missing slugs are generated from display_name, and might not match the
+          outer "slug" key, in case profile_list is a dict. This is ok.)
         - `kubespawner_override`: a dictionary with overrides to apply to the KubeSpawner
           settings. Each value can be either the final value to change or a callable that
           take the `KubeSpawner` instance as parameter and return the final value. This can
           be further overridden by 'profile_options'
-          If the traitlet being overriden is a *dictionary*, the dictionary
-          will be *recursively updated*, rather than overriden. If you want to
+          If the traitlet being overridden is a *dictionary*, the dictionary
+          will be *recursively updated*, rather than overridden. If you want to
           remove a key, set its value to `None`
         - `profile_options`: A dictionary of sub-options that allow users to further customize the
           selected profile. By default, these are rendered as a dropdown with the label
@@ -1817,8 +1825,8 @@ class KubeSpawner(Spawner):
               and value can be either the final value or a callable that returns the final
               value when called with the spawner instance as the only parameter. The callable
               may be async.
-              If the traitlet being overriden is a *dictionary*, the dictionary
-              will be *recursively updated*, rather than overriden. If you want to
+              If the traitlet being overridden is a *dictionary*, the dictionary
+              will be *recursively updated*, rather than overridden. If you want to
               remove a key, set its value to `None`
 
         kubespawner setting overrides work in the following manner, with items further in the
@@ -1830,7 +1838,7 @@ class KubeSpawner(Spawner):
            profile, applied linearly based on the ordering of the option in the profile
            definition configuration
 
-        Example::
+        List example::
 
             c.KubeSpawner.profile_list = [
                 {
@@ -1878,6 +1886,48 @@ class KubeSpawner(Spawner):
                     },
                 },
             ]
+        Dict example::
+
+            c.KubeSpawner.profile_list = {
+                "demo-1": {
+                    'display_name': 'Demo - profile_list entry 1',
+                    'description': 'Demo description for profile_list entry 1, and it should look good even though it is a bit lengthy.',
+                    'slug': 'demo-1',
+                    'default': True,
+                    'profile_options': {
+                        'image': {
+                            'display_name': 'Image',
+                            'choices': {
+                                'base': {
+                                    'display_name': 'jupyter/base-notebook:latest',
+                                    'kubespawner_override': {
+                                        'image': 'jupyter/base-notebook:latest'
+                                    },
+                                },
+                            },
+                            'unlisted_choice': {
+                                'enabled': True,
+                                'display_name': 'Other image',
+                                'display_name_in_choices': 'Enter image manually',
+                                'validation_regex': '^jupyter/.+:.+$',
+                                'validation_message': 'Must be an image matching ^jupyter/<name>:<tag>$',
+                                'kubespawner_override': {'image': '{value}'},
+                            },
+                        },
+                    },
+                    'kubespawner_override': {
+                        'default_url': '/lab',
+                    },
+                },
+                demo-2: {
+                    'display_name': 'Demo - profile_list entry 2',
+                    'slug': 'demo-2',
+                    'kubespawner_override': {
+                        'extra_resource_guarantees': {"nvidia.com/gpu": "1"},
+                    },
+                },
+            }
+
 
         Instead of a list of dictionaries, this could also be a callable that takes as one
         parameter the current spawner instance and returns a list of dictionaries. The
@@ -1910,6 +1960,33 @@ class KubeSpawner(Spawner):
         more information on how pod termination works.
 
         Defaults to `1`.
+        """,
+    )
+
+    slow_spawn_message_threshold = Integer(
+        60,
+        config=True,
+        help="""
+        Time in seconds to wait before injecting a 'please be patient' message
+        to display to the user. If this value is 0, no message will be shown.
+        """,
+    )
+
+    slow_spawn_message_frequency = Integer(
+        5,
+        config=True,
+        help="""
+        Sets a delay of N seconds between updates to the message buffer, so
+        that we don't spam the user with too many messages.
+        """,
+    )
+
+    slow_spawn_message = Unicode(
+        "Server launch is taking longer than expected. Please be patient! Current time spent waiting: {seconds} seconds.",
+        config=True,
+        help="""
+        The injected timing message to display to the user. The variable `{seconds}`
+        will be replaced by the number of seconds the spawn has currently taken.
         """,
     )
 
@@ -2219,6 +2296,19 @@ class KubeSpawner(Spawner):
         """,
     )
 
+    def _get_pod_port(self, pod):
+        """
+        Return the port of the server in the pod.
+
+        That port must be called 'notebook-port'.
+        """
+        for container in pod["spec"]["containers"]:
+            for port in container["ports"]:
+                if port.get("name") == "notebook-port":
+                    return port["containerPort"]
+        pod_name = pod["metadata"]["name"]
+        raise KeyError(f"No port 'notebook-port' in pod {pod_name}")
+
     def _get_pod_url(self, pod):
         """Return the pod url
 
@@ -2249,10 +2339,12 @@ class KubeSpawner(Spawner):
                 ]
             )
 
+        port = self._get_pod_port(pod)
+
         return "{}://{}:{}".format(
             proto,
             hostname,
-            self.port,
+            port,
         )
 
     async def get_pod_manifest(self):
@@ -2389,7 +2481,7 @@ class KubeSpawner(Spawner):
             annotations=annotations,
         )
 
-    def get_service_manifest(self, owner_reference):
+    def get_service_manifest(self, owner_reference, port):
         """
         Make a service manifest for dns.
         """
@@ -2403,7 +2495,7 @@ class KubeSpawner(Spawner):
         # TODO: validate that the service name
         return make_service(
             name=self.pod_name,
-            port=self.port,
+            port=port,
             selector=selector,
             owner_references=[owner_reference],
             labels=labels,
@@ -2742,6 +2834,10 @@ class KubeSpawner(Spawner):
         progress = 0
         next_event = 0
 
+        # timers for deciding when to show slow spawn patience message
+        start_time = time.perf_counter()
+        last_message_time = 0
+
         break_while_loop = False
         while True:
             # This logic avoids a race condition. self._start() will be invoked by
@@ -2757,6 +2853,22 @@ class KubeSpawner(Spawner):
             # .sleep() and missed something.
             if start_future and start_future.done():
                 break_while_loop = True
+
+            # if the timer is greater than self.server_spawn_launch_timer_threshold
+            # display a message to the user with an incrementing count in seconds
+            elapsed = time.perf_counter() - start_time
+            if (
+                elapsed >= self.slow_spawn_message_threshold
+                and self.slow_spawn_message_threshold > 0
+            ):
+                # don't spam the user, so only update the timer message every few seconds
+                if elapsed >= last_message_time + self.slow_spawn_message_frequency:
+                    patience_message = textwrap.dedent(self.slow_spawn_message)
+                    patience_message = patience_message.format(seconds=int(elapsed))
+                    last_message_time = elapsed
+                    yield {
+                        'message': patience_message,
+                    }
 
             events = self.events
             len_events = len(events)
@@ -3268,7 +3380,9 @@ class KubeSpawner(Spawner):
                     )
 
                 if self.internal_ssl or self.services_enabled:
-                    service_manifest = self.get_service_manifest(owner_reference)
+                    service_manifest = self.get_service_manifest(
+                        owner_reference, self._get_pod_port(pod)
+                    )
                     await exponential_backoff(
                         partial(
                             self._ensure_not_exists,
@@ -3528,7 +3642,9 @@ class KubeSpawner(Spawner):
             return self._render_options_form_dynamically
         else:
             # Return the rendered string, as it does not change
-            return self._render_options_form(self.profile_list)
+            return self._render_options_form(
+                self._sorted_dict_values(self.profile_list)
+            )
 
     @default('options_from_form')
     def _options_from_form_default(self):
@@ -3821,9 +3937,10 @@ class KubeSpawner(Spawner):
         Override in subclasses to support other options.
         """
         # get an initialized profile list
-        profile_list = self.profile_list
+        profile_list = self._sorted_dict_values(self.profile_list)
         if callable(profile_list):
             profile_list = await maybe_future(profile_list(self))
+
         profile_list = self._get_initialized_profile_list(profile_list)
 
         # validate user_options against initialized profile_list
