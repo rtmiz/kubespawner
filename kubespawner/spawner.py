@@ -12,7 +12,9 @@ import os
 import re
 import string
 import sys
+import uuid
 import warnings
+from datetime import datetime, timezone
 from functools import partial
 from typing import Optional, Tuple, Type
 from urllib.parse import urlparse
@@ -2575,7 +2577,13 @@ class KubeSpawner(Spawner):
         # reset namespace as well?
 
     def add_custom_event(
-        self, eventTime, lastTimestamp, message, type, involvedObject, metadata
+        self,
+        message,
+        type="Normal",
+        eventTime=None,
+        lastTimestamp=None,
+        involvedObject=None,
+        metadata=None,
     ):
         """Add an event to the event queue
 
@@ -2584,6 +2592,15 @@ class KubeSpawner(Spawner):
         """
         if not self.events_enabled:
             return
+
+        if eventTime is None and lastTimestamp is None:
+            lastTimestamp = datetime.now(timezone.utc).isoformat()
+
+        if involvedObject is None:
+            involvedObject = {"name": self.pod_name}
+
+        if metadata is None:
+            metadata = {"uid": uuid.uuid4().hex}
 
         event = {
             "eventTime": eventTime,
