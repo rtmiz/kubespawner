@@ -12,9 +12,9 @@ import os
 import re
 import string
 import sys
-import uuid
 import textwrap
 import time
+import uuid
 import warnings
 from datetime import datetime, timezone
 from functools import partial
